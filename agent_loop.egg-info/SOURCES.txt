@@ -1,7 +1,0 @@
-pyproject.toml
-agent_loop/__init__.py
-agent_loop.egg-info/PKG-INFO
-agent_loop.egg-info/SOURCES.txt
-agent_loop.egg-info/dependency_links.txt
-agent_loop.egg-info/requires.txt
-agent_loop.egg-info/top_level.txt
