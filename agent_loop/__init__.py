@@ -108,7 +108,7 @@ def _conversation_loop(graph, config, fresh_start_message, resume_message, verba
             user_input = input("You: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nSession saved. Goodbye.")
-            break
+            sys.exit(0)
 
         if not user_input:
             continue
