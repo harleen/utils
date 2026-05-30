@@ -28,6 +28,10 @@ import sys
 import warnings
 from pathlib import Path
 
+from prompt_toolkit import prompt as _pt_prompt
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.filters import in_paste_mode
+
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, ToolMessage
 
@@ -90,11 +94,41 @@ def run_agent(
         )
 
 
+# ── input handling ───────────────────────────────────────────────────────────
+
+def _multiline_prompt(label: str) -> str:
+    """
+    Prompt for user input with proper paste handling via bracketed paste detection.
+    - Normal typing: Enter submits
+    - Pasting multi-line text: newlines are preserved, Enter after paste submits
+    - Meta+Enter (Alt+Enter / Escape+Enter): always submits
+    """
+    kb = KeyBindings()
+
+    @kb.add("enter", filter=~in_paste_mode)
+    def _enter(event):
+        event.current_buffer.validate_and_handle()
+
+    @kb.add("enter", filter=in_paste_mode)
+    def _paste_enter(event):
+        event.current_buffer.insert_text("\n")
+
+    @kb.add("escape", "enter")
+    def _meta_enter(event):
+        event.current_buffer.validate_and_handle()
+
+    return _pt_prompt(label, multiline=True, key_bindings=kb)
+
+
 # ── conversation loop ─────────────────────────────────────────────────────────
 
 def _conversation_loop(graph, config, fresh_start_message, resume_message, verbatim_tool_names):
     existing = graph.get_state(config)
     tid = config["configurable"]["thread_id"]
+
+    # Self-heal: close any tool calls left open by a previous crash or interrupt
+    if _close_orphaned_tool_calls(graph, config):
+        print("[Recovered from previous session error — continuing]\n")
 
     if existing.values:
         print(f"\n[Resuming — {tid}]\n")
@@ -105,7 +139,7 @@ def _conversation_loop(graph, config, fresh_start_message, resume_message, verba
 
     while True:
         try:
-            user_input = input("You: ").strip()
+            user_input = _multiline_prompt("You: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\nSession saved. Goodbye.")
             sys.exit(0)
@@ -243,11 +277,15 @@ def _build_message(user_input: str) -> dict:
 
 # ── interrupt state management ────────────────────────────────────────────────
 
-def _close_orphaned_tool_calls(graph, config) -> None:
-    """Add cancelled ToolMessages for any tool_calls with no result (from Ctrl+C)."""
+def _close_orphaned_tool_calls(graph, config) -> bool:
+    """
+    Add cancelled ToolMessages for any tool_calls with no result.
+    Called on Ctrl+C and on startup to self-heal after crashes.
+    Returns True if any orphaned calls were found and closed.
+    """
     state = graph.get_state(config)
     if not state.values:
-        return
+        return False
 
     messages   = state.values["messages"]
     result_ids = {m.tool_call_id for m in messages if m.type == "tool"}
@@ -262,11 +300,13 @@ def _close_orphaned_tool_calls(graph, config) -> None:
     if orphaned:
         graph.update_state(config, {"messages": [
             ToolMessage(
-                content="[Cancelled — session exited before this tool ran]",
+                content="[Interrupted — tool did not complete]",
                 tool_call_id=tc["id"],
             )
             for tc in orphaned
         ]})
+        return True
+    return False
 
 
 def _cancel_tool_calls(graph, config, ai_message) -> None:
