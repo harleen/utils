@@ -7,11 +7,14 @@ name = "agent-loop"
 version = "0.1.0"
 description = "Reusable LangGraph ReAct agent harness — terminal loop, image support, interrupt-before-tools approval"
 requires-python = ">=3.11"
+# Pinned with ~= (compatible release): patch updates install automatically,
+# minor bumps require deliberate bump here + test. Upgrade intentionally,
+# not on a schedule — LangGraph especially breaks APIs between minor versions.
 dependencies = [
-    "langchain-anthropic>=1.0",
-    "langgraph>=1.0",
-    "langgraph-checkpoint-sqlite>=3.0",
-    "anthropic>=0.100",
+    "langchain-anthropic~=1.4",
+    "langgraph~=1.2",
+    "langgraph-checkpoint-sqlite~=3.1",
+    "anthropic~=0.104",
 ]
 
 [tool.setuptools.packages.find]

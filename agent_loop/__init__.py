@@ -33,7 +33,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.filters import in_paste_mode
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langgraph")
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -50,6 +50,7 @@ def run_agent(
     fresh_start_message: str = "Ready.",
     resume_message: str = "Welcome back.",
     verbatim_tool_names: "list[str] | None" = None,
+    auto_approve_tool_names: "list[str] | None" = None,
     model: str = "claude-haiku-4-5-20251001",
 ) -> None:
     """
@@ -68,19 +69,24 @@ def run_agent(
                               output is structured for human reading (e.g. journal entries).
         model:                Anthropic model ID
     """
-    model_obj = ChatAnthropic(model=model, temperature=0)
+    # Prompt caching: system prompt is sent every turn — caching saves significant tokens
+    model_obj = ChatAnthropic(
+        model=model,
+        temperature=0,
+        model_kwargs={"extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"}},
+    )
+    system_msg = SystemMessage(content=[{
+        "type": "text",
+        "text": system_prompt,
+        "cache_control": {"type": "ephemeral"},
+    }])
 
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
-        # create_react_agent builds a two-node graph:
-        #   agent node  — calls the model; may produce tool_calls
-        #   tools node  — executes the tool_calls
-        # With interrupt_before=["tools"], the graph pauses between the two nodes
-        # so the user can approve each call before it runs.
         graph = create_react_agent(
             model_obj,
             tools=tools,
             checkpointer=checkpointer,
-            prompt=system_prompt,
+            prompt=system_msg,
             interrupt_before=["tools"],
         )
 
@@ -91,6 +97,7 @@ def run_agent(
             fresh_start_message=fresh_start_message,
             resume_message=resume_message,
             verbatim_tool_names=verbatim_tool_names or [],
+            auto_approve_tool_names=set(auto_approve_tool_names or []),
         )
 
 
@@ -122,7 +129,7 @@ def _multiline_prompt(label: str) -> str:
 
 # ── conversation loop ─────────────────────────────────────────────────────────
 
-def _conversation_loop(graph, config, fresh_start_message, resume_message, verbatim_tool_names):
+def _conversation_loop(graph, config, fresh_start_message, resume_message, verbatim_tool_names, auto_approve_tool_names):
     existing = graph.get_state(config)
     tid = config["configurable"]["thread_id"]
 
@@ -132,10 +139,10 @@ def _conversation_loop(graph, config, fresh_start_message, resume_message, verba
 
     if existing.values:
         print(f"\n[Resuming — {tid}]\n")
-        _run_turn(graph, config, resume_message, verbatim_tool_names)
+        _run_turn(graph, config, resume_message, verbatim_tool_names, auto_approve_tool_names)
     else:
         print(f"\n[New session — {tid}]\n")
-        _run_turn(graph, config, fresh_start_message, verbatim_tool_names)
+        _run_turn(graph, config, fresh_start_message, verbatim_tool_names, auto_approve_tool_names)
 
     while True:
         try:
@@ -150,15 +157,16 @@ def _conversation_loop(graph, config, fresh_start_message, resume_message, verba
             print("Session saved. Goodbye.")
             break
 
-        _run_turn(graph, config, user_input, verbatim_tool_names)
+        _run_turn(graph, config, user_input, verbatim_tool_names, auto_approve_tool_names)
 
 
 # ── turn execution ────────────────────────────────────────────────────────────
 
-def _run_turn(graph, config, user_input: str, verbatim_tool_names: list) -> None:
+def _run_turn(graph, config, user_input: str, verbatim_tool_names: list, auto_approve_tool_names: set) -> None:
     """
     Send one message and run until the agent finishes responding.
     Handles the interrupt_before=["tools"] pause loop internally.
+    Read-only tools in auto_approve_tool_names proceed without prompting.
     """
     _stream_and_print(graph, config, {"messages": [_build_message(user_input)]}, verbatim_tool_names)
 
@@ -167,7 +175,7 @@ def _run_turn(graph, config, user_input: str, verbatim_tool_names: list) -> None
         if not state.next:
             break
 
-        last_msg  = state.values["messages"][-1]
+        last_msg   = state.values["messages"][-1]
         tool_calls = getattr(last_msg, "tool_calls", [])
 
         if tool_calls:
@@ -175,11 +183,17 @@ def _run_turn(graph, config, user_input: str, verbatim_tool_names: list) -> None
             for tc in tool_calls:
                 print(f"  [→ {tc['name']}({_fmt_args(tc['args'])})]")
 
+        # Auto-approve read-only tools — no prompt needed
+        if tool_calls and auto_approve_tool_names and all(
+            tc["name"] in auto_approve_tool_names for tc in tool_calls
+        ):
+            print("  [auto]\n", flush=True)
+            _stream_and_print(graph, config, None, verbatim_tool_names)
+            continue
+
         try:
             feedback = input("  [Enter] proceed  |  type to redirect: ").strip()
         except KeyboardInterrupt:
-            # Ctrl+C here means tool_calls exist in DB but never ran.
-            # Close them out so the next startup doesn't hit invalid chat history.
             _close_orphaned_tool_calls(graph, config)
             print("\nSession saved. Goodbye.")
             sys.exit(0)
@@ -200,8 +214,7 @@ def _run_turn(graph, config, user_input: str, verbatim_tool_names: list) -> None
 def _stream_and_print(graph, config, graph_input, verbatim_tool_names: list) -> None:
     """
     Consume the graph stream and print output.
-    - verbatim_tool_names: print these tool results immediately and directly
-    - all other output: print the final AI message once the stream completes
+    Verbatim tool results are printed immediately; AI text printed once complete.
     """
     last_msg      = None
     printed_tools = set()
