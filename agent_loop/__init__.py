@@ -40,6 +40,11 @@ try:
 except ImportError:
     ChatOpenAI = None
 
+try:
+    from langchain_ollama import ChatOllama
+except ImportError:
+    ChatOllama = None
+
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langgraph")
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import create_react_agent
@@ -79,13 +84,27 @@ def run_agent(
         verbatim_tool_names:  Tools whose output is printed directly to the terminal,
                               bypassing Claude's summarization. Useful when the tool
                               output is structured for human reading (e.g. journal entries).
-        model:                Model ID (Anthropic or OpenAI depending on model_provider)
-        model_provider:       "anthropic" (default) or "openai"
+        model:                Model ID (Anthropic, OpenAI, or Ollama depending on model_provider)
+        model_provider:       "anthropic" (default), "openai", or "ollama"
     """
     if model_provider == "openai":
         if ChatOpenAI is None:
             raise ImportError("langchain-openai is not installed. Run: pip install langchain-openai")
         model_obj = ChatOpenAI(model=model, temperature=0)
+        system_msg = SystemMessage(content=system_prompt)
+    elif model_provider == "ollama":
+        if ChatOllama is None:
+            raise ImportError("langchain-ollama is not installed. Run: pip install langchain-ollama")
+        model_obj = ChatOllama(
+            model=model,
+            temperature=0,
+            # Backstops against runaway generation on reasoning models (thinking mode
+            # can occasionally loop) — same values validated in poetry-tools' tag_lib.py.
+            # Reasoning itself is left on: tool selection benefits from it, and the
+            # harness's tasks are bounded tool calls, not open-ended generation.
+            num_predict=8192,
+            client_kwargs={"timeout": 300},
+        )
         system_msg = SystemMessage(content=system_prompt)
     else:
         # Prompt caching: system prompt is sent every turn — caching saves significant tokens
@@ -117,7 +136,7 @@ def run_agent(
             resume_message=resume_message,
             verbatim_tool_names=verbatim_tool_names or [],
             auto_approve_tool_names=set(auto_approve_tool_names or []),
-            streaming=(model_provider == "openai"),
+            streaming=(model_provider in ("openai", "ollama")),
         )
 
 

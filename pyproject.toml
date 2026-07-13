@@ -29,4 +29,8 @@ google = [
 ]
 openai = [
     "langchain-openai>=0.3",
+    "openai>=1.0",
+]
+ollama = [
+    "langchain-ollama>=1.1",
 ]
