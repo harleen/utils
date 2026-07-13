@@ -35,9 +35,20 @@ from prompt_toolkit.filters import in_paste_mode
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
 
+try:
+    from langchain_openai import ChatOpenAI
+except ImportError:
+    ChatOpenAI = None
+
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langgraph")
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.prebuilt import create_react_agent
+
+# Terminal color codes — swap _ASSISTANT value to change response color:
+#   cyan    \033[36m   yellow  \033[33m
+#   magenta \033[35m   green   \033[32m
+_ASSISTANT = "\033[36m"
+_RESET     = "\033[0m"
 
 
 # ── public entry point ────────────────────────────────────────────────────────
@@ -52,6 +63,7 @@ def run_agent(
     verbatim_tool_names: "list[str] | None" = None,
     auto_approve_tool_names: "list[str] | None" = None,
     model: str = "claude-haiku-4-5-20251001",
+    model_provider: str = "anthropic",
 ) -> None:
     """
     Build a LangGraph ReAct agent and start the terminal conversation loop.
@@ -67,19 +79,26 @@ def run_agent(
         verbatim_tool_names:  Tools whose output is printed directly to the terminal,
                               bypassing Claude's summarization. Useful when the tool
                               output is structured for human reading (e.g. journal entries).
-        model:                Anthropic model ID
+        model:                Model ID (Anthropic or OpenAI depending on model_provider)
+        model_provider:       "anthropic" (default) or "openai"
     """
-    # Prompt caching: system prompt is sent every turn — caching saves significant tokens
-    model_obj = ChatAnthropic(
-        model=model,
-        temperature=0,
-        model_kwargs={"extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"}},
-    )
-    system_msg = SystemMessage(content=[{
-        "type": "text",
-        "text": system_prompt,
-        "cache_control": {"type": "ephemeral"},
-    }])
+    if model_provider == "openai":
+        if ChatOpenAI is None:
+            raise ImportError("langchain-openai is not installed. Run: pip install langchain-openai")
+        model_obj = ChatOpenAI(model=model, temperature=0)
+        system_msg = SystemMessage(content=system_prompt)
+    else:
+        # Prompt caching: system prompt is sent every turn — caching saves significant tokens
+        model_obj = ChatAnthropic(
+            model=model,
+            temperature=0,
+            model_kwargs={"extra_headers": {"anthropic-beta": "prompt-caching-2024-07-31"}},
+        )
+        system_msg = SystemMessage(content=[{
+            "type": "text",
+            "text": system_prompt,
+            "cache_control": {"type": "ephemeral"},
+        }])
 
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         graph = create_react_agent(
@@ -98,6 +117,7 @@ def run_agent(
             resume_message=resume_message,
             verbatim_tool_names=verbatim_tool_names or [],
             auto_approve_tool_names=set(auto_approve_tool_names or []),
+            streaming=(model_provider == "openai"),
         )
 
 
@@ -129,20 +149,27 @@ def _multiline_prompt(label: str) -> str:
 
 # ── conversation loop ─────────────────────────────────────────────────────────
 
-def _conversation_loop(graph, config, fresh_start_message, resume_message, verbatim_tool_names, auto_approve_tool_names):
+def _conversation_loop(graph, config, fresh_start_message, resume_message, verbatim_tool_names, auto_approve_tool_names, streaming=False):
     existing = graph.get_state(config)
     tid = config["configurable"]["thread_id"]
 
-    # Self-heal: close any tool calls left open by a previous crash or interrupt
+    # Self-heal: close any tool calls left open by a previous crash or interrupt.
+    # After patching, stream None to let the graph process the cancelled results
+    # and reach a clean state before we inject the resume message.
     if _close_orphaned_tool_calls(graph, config):
         print("[Recovered from previous session error — continuing]\n")
+        try:
+            # Always use values mode for recovery — token streaming is unstable here
+            _stream_values(graph, config, None, verbatim_tool_names)
+        except Exception:
+            pass  # if recovery stream fails, proceed anyway
 
     if existing.values:
         print(f"\n[Resuming — {tid}]\n")
-        _run_turn(graph, config, resume_message, verbatim_tool_names, auto_approve_tool_names)
+        _run_turn(graph, config, resume_message, verbatim_tool_names, auto_approve_tool_names, streaming)
     else:
         print(f"\n[New session — {tid}]\n")
-        _run_turn(graph, config, fresh_start_message, verbatim_tool_names, auto_approve_tool_names)
+        _run_turn(graph, config, fresh_start_message, verbatim_tool_names, auto_approve_tool_names, streaming)
 
     while True:
         try:
@@ -157,18 +184,18 @@ def _conversation_loop(graph, config, fresh_start_message, resume_message, verba
             print("Session saved. Goodbye.")
             break
 
-        _run_turn(graph, config, user_input, verbatim_tool_names, auto_approve_tool_names)
+        _run_turn(graph, config, user_input, verbatim_tool_names, auto_approve_tool_names, streaming)
 
 
 # ── turn execution ────────────────────────────────────────────────────────────
 
-def _run_turn(graph, config, user_input: str, verbatim_tool_names: list, auto_approve_tool_names: set) -> None:
+def _run_turn(graph, config, user_input: str, verbatim_tool_names: list, auto_approve_tool_names: set, streaming: bool = False) -> None:
     """
     Send one message and run until the agent finishes responding.
     Handles the interrupt_before=["tools"] pause loop internally.
     Read-only tools in auto_approve_tool_names proceed without prompting.
     """
-    _stream_and_print(graph, config, {"messages": [_build_message(user_input)]}, verbatim_tool_names)
+    _stream_and_print(graph, config, {"messages": [_build_message(user_input)]}, verbatim_tool_names, streaming)
 
     while True:
         state = graph.get_state(config)
@@ -188,7 +215,7 @@ def _run_turn(graph, config, user_input: str, verbatim_tool_names: list, auto_ap
             tc["name"] in auto_approve_tool_names for tc in tool_calls
         ):
             print("  [auto]\n", flush=True)
-            _stream_and_print(graph, config, None, verbatim_tool_names)
+            _stream_and_print(graph, config, None, verbatim_tool_names, streaming)
             continue
 
         try:
@@ -204,18 +231,23 @@ def _run_turn(graph, config, user_input: str, verbatim_tool_names: list, auto_ap
                 graph, config,
                 {"messages": [{"role": "user", "content": feedback}]},
                 verbatim_tool_names,
+                streaming,
             )
         else:
-            _stream_and_print(graph, config, None, verbatim_tool_names)
+            _stream_and_print(graph, config, None, verbatim_tool_names, streaming)
 
 
 # ── streaming ─────────────────────────────────────────────────────────────────
 
-def _stream_and_print(graph, config, graph_input, verbatim_tool_names: list) -> None:
-    """
-    Consume the graph stream and print output.
-    Verbatim tool results are printed immediately; AI text printed once complete.
-    """
+def _stream_and_print(graph, config, graph_input, verbatim_tool_names: list, streaming: bool = False) -> None:
+    if streaming:
+        _stream_tokens(graph, config, graph_input, verbatim_tool_names)
+    else:
+        _stream_values(graph, config, graph_input, verbatim_tool_names)
+
+
+def _stream_values(graph, config, graph_input, verbatim_tool_names: list) -> None:
+    """Anthropic path: collect full response then print."""
     last_msg      = None
     printed_tools = set()
 
@@ -232,6 +264,40 @@ def _stream_and_print(graph, config, graph_input, verbatim_tool_names: list) -> 
         _print_ai_text(last_msg)
 
 
+def _stream_tokens(graph, config, graph_input, verbatim_tool_names: list) -> None:
+    """OpenAI path: print tokens as they arrive."""
+    from langchain_core.messages import AIMessageChunk, ToolMessage as LCToolMessage
+
+    printed_tools  = set()
+    in_ai_response = False
+
+    for chunk, _ in graph.stream(graph_input, config, stream_mode="messages"):
+        if isinstance(chunk, AIMessageChunk):
+            content = chunk.content
+            if isinstance(content, str) and content:
+                if not in_ai_response:
+                    print(f"\n{_ASSISTANT}Assistant: ", end="", flush=True)
+                    in_ai_response = True
+                print(content, end="", flush=True)
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                        if not in_ai_response:
+                            print(f"\n{_ASSISTANT}Assistant: ", end="", flush=True)
+                            in_ai_response = True
+                        print(block["text"], end="", flush=True)
+        elif isinstance(chunk, LCToolMessage):
+            if chunk.name in verbatim_tool_names and chunk.id not in printed_tools:
+                if in_ai_response:
+                    print("\n")
+                    in_ai_response = False
+                print(f"\n{chunk.content}\n")
+                printed_tools.add(chunk.id)
+
+    if in_ai_response:
+        print(f"{_RESET}\n")
+
+
 def _print_ai_text(msg) -> None:
     if msg.type != "ai":
         return
@@ -245,7 +311,7 @@ def _print_ai_text(msg) -> None:
     else:
         return
     if text:
-        print(f"\nClaude: {text}\n")
+        print(f"\n{_ASSISTANT}Assistant: {text}{_RESET}\n")
 
 
 # ── image support ─────────────────────────────────────────────────────────────

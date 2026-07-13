@@ -27,3 +27,6 @@ google = [
     "google-auth-httplib2>=0.2",
     "google-api-python-client>=2.0",
 ]
+openai = [
+    "langchain-openai>=0.3",
+]
