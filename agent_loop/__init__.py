@@ -34,6 +34,7 @@ from prompt_toolkit.filters import in_paste_mode
 
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.tools import tool as _tool
 
 try:
     from langchain_openai import ChatOpenAI
@@ -54,6 +55,11 @@ from langgraph.prebuilt import create_react_agent
 #   magenta \033[35m   green   \033[32m
 _ASSISTANT = "\033[36m"
 _RESET     = "\033[0m"
+
+# Tools this module injects itself (see get_model_provider below) are always safe to
+# auto-approve — read-only, zero cost, zero side effects. Baked in here rather than left
+# for every downstream harness to rediscover and configure independently.
+_BUILTIN_AUTO_APPROVE = {"get_model_provider"}
 
 
 # ── public entry point ────────────────────────────────────────────────────────
@@ -119,10 +125,18 @@ def run_agent(
             "cache_control": {"type": "ephemeral"},
         }])
 
+    @_tool
+    def get_model_provider() -> str:
+        """Returns which model is currently answering this conversation: 'ollama'
+        (running fully locally/offline) or 'anthropic'/'openai' (running in the cloud)."""
+        return model_provider
+
+    all_tools = list(tools) + [get_model_provider]
+
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         graph = create_react_agent(
             model_obj,
-            tools=tools,
+            tools=all_tools,
             checkpointer=checkpointer,
             prompt=system_msg,
             interrupt_before=["tools"],
@@ -135,7 +149,7 @@ def run_agent(
             fresh_start_message=fresh_start_message,
             resume_message=resume_message,
             verbatim_tool_names=verbatim_tool_names or [],
-            auto_approve_tool_names=set(auto_approve_tool_names or []),
+            auto_approve_tool_names=set(auto_approve_tool_names or []) | _BUILTIN_AUTO_APPROVE,
             streaming=(model_provider in ("openai", "ollama")),
         )
 
