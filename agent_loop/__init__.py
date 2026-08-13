@@ -33,7 +33,7 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.filters import in_paste_mode
 
 from langchain_anthropic import ChatAnthropic
-from langchain_core.messages import AIMessage, SystemMessage, ToolMessage
+from langchain_core.messages import AIMessage, SystemMessage, ToolMessage, trim_messages
 from langchain_core.tools import tool as _tool
 
 try:
@@ -75,6 +75,7 @@ def run_agent(
     auto_approve_tool_names: "list[str] | None" = None,
     model: str = "claude-haiku-4-5-20251001",
     model_provider: str = "anthropic",
+    max_context_messages: int = 50,
 ) -> None:
     """
     Build a LangGraph ReAct agent and start the terminal conversation loop.
@@ -92,6 +93,12 @@ def run_agent(
                               output is structured for human reading (e.g. journal entries).
         model:                Model ID (Anthropic, OpenAI, or Ollama depending on model_provider)
         model_provider:       "anthropic" (default), "openai", or "ollama"
+        max_context_messages: Cap on how many recent messages get sent to the model on each
+                              call (default 50). The FULL history is always kept forever in
+                              the checkpoint DB regardless of this — trimming only affects
+                              what's resent to the API each turn, not what's persisted. A
+                              built-in `recall_earlier_messages` tool lets the model search
+                              back through the untrimmed history on demand when needed.
     """
     if model_provider == "openai":
         if ChatOpenAI is None:
@@ -131,18 +138,145 @@ def run_agent(
         (running fully locally/offline) or 'anthropic'/'openai' (running in the cloud)."""
         return model_provider
 
+    def _trim_hook(state: dict) -> dict:
+        """pre_model_hook — bounds what's sent to the model to the most recent
+        max_context_messages, without touching the permanently persisted `messages`
+        state (returning llm_input_messages does NOT overwrite the checkpoint). Trims
+        safely around tool-call/tool-response pairs (start_on="human") so a ToolMessage
+        never gets separated from the AIMessage that triggered it."""
+        messages = state["messages"]
+        if len(messages) > max_context_messages:
+            print(
+                f"\n[Note: this session has grown to {len(messages)} messages — sending "
+                f"only the most recent {max_context_messages} to the model. Full history "
+                f"stays saved; use recall_earlier_messages to look further back.]\n",
+                flush=True,
+            )
+        trimmed = trim_messages(
+            messages,
+            max_tokens=max_context_messages,
+            token_counter=len,
+            strategy="last",
+            start_on="human",
+        )
+        return {"llm_input_messages": trimmed}
+
     all_tools = list(tools) + [get_model_provider]
 
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
+        config = {"configurable": {"thread_id": thread_id}}
+
+        @_tool
+        def recall_earlier_messages(
+            keywords: "list[str]" = [],
+            match_all: bool = False,
+            n: int = 5,
+            context_window: int = 2,
+            before_current_window: bool = False,
+        ) -> str:
+            """
+            Search the FULL conversation history for this thread (not just what's
+            currently in context). For each match, returns a short excerpt around it —
+            the matching message plus a few messages before/after — not just the single
+            matching line in isolation, so the result reads as a coherent piece of the
+            conversation, not a disconnected fragment.
+
+            keywords: terms to search for (case-insensitive substring match) across all
+              past messages in this thread. Leave empty to scroll back instead of
+              searching.
+            match_all: if True, a message must contain ALL of keywords to count as a
+              match (AND logic — e.g. keywords=["Rattle", "chapbook"] narrows to messages
+              mentioning both). If False (default), matching ANY keyword counts (OR
+              logic — broader).
+            n: max number of DISTINCT matches/excerpts to return (default 5) — capped so
+              this doesn't re-inflate context back to where trimming started. Overlapping
+              excerpts (two hits close together) get merged into one, not duplicated.
+            context_window: how many messages before and after each match to include, so
+              the excerpt has enough surrounding conversation to actually make sense
+              (default 2 each side — up to ~5 messages per excerpt, so worst case ~25
+              messages total for n=5).
+            before_current_window: if True and keywords is empty, skip searching — just
+              return the messages immediately preceding what's currently visible (plain
+              scroll-back).
+
+            Example: recall_earlier_messages(keywords=["Rattle", "chapbook"],
+            match_all=True, n=3) — find up to 3 places where Rattle and chapbook were
+            both mentioned, with context around each.
+            """
+            state = checkpointer.get_tuple(config)
+            if state is None:
+                return "No conversation history found."
+            all_messages = state.checkpoint["channel_values"].get("messages", [])
+            if not all_messages:
+                return "No conversation history found."
+
+            def _text(m) -> str:
+                content = getattr(m, "content", "")
+                if isinstance(content, list):
+                    parts = [
+                        b.get("text", "") for b in content
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    return " ".join(parts)
+                return str(content)
+
+            def _role(m) -> str:
+                return getattr(m, "type", m.__class__.__name__)
+
+            if not keywords:
+                if not before_current_window:
+                    return "Provide keywords to search for, or set before_current_window=True to scroll back."
+                tail_start = max(0, len(all_messages) - max_context_messages)
+                span = n * (context_window * 2 + 1)
+                window = all_messages[max(0, tail_start - span):tail_start]
+                if not window:
+                    return "No earlier messages found before the current window."
+                return "\n".join(f"[{_role(m)}] {_text(m)[:300]}" for m in window)
+
+            lowered = [k.lower() for k in keywords]
+            hit_indices = []
+            for i, m in enumerate(all_messages):
+                text_lower = _text(m).lower()
+                matched = (
+                    all(k in text_lower for k in lowered) if match_all
+                    else any(k in text_lower for k in lowered)
+                )
+                if matched:
+                    hit_indices.append(i)
+
+            if not hit_indices:
+                return f"No messages found matching: {', '.join(keywords)}"
+
+            # Build a window around each hit, merging overlaps, capped at n windows.
+            # Scan more raw hits than n in case heavy overlap merges several into one.
+            windows: list[list[int]] = []
+            for idx in hit_indices[: n * 3]:
+                start = max(0, idx - context_window)
+                end = min(len(all_messages), idx + context_window + 1)
+                if windows and start <= windows[-1][1]:
+                    windows[-1][1] = max(windows[-1][1], end)
+                else:
+                    windows.append([start, end])
+                if len(windows) >= n:
+                    break
+
+            match_kind = "all" if match_all else "any"
+            out = [f"{len(windows)} match(es) for {', '.join(keywords)} ({match_kind}):\n"]
+            for start, end in windows:
+                out.append(f"--- messages {start}-{end - 1} ---")
+                for m in all_messages[start:end]:
+                    out.append(f"[{_role(m)}] {_text(m)[:300]}")
+                out.append("")
+            return "\n".join(out)
+
         graph = create_react_agent(
             model_obj,
-            tools=all_tools,
+            tools=all_tools + [recall_earlier_messages],
             checkpointer=checkpointer,
             prompt=system_msg,
             interrupt_before=["tools"],
+            pre_model_hook=_trim_hook,
         )
-
-        config = {"configurable": {"thread_id": thread_id}}
 
         _conversation_loop(
             graph, config,
