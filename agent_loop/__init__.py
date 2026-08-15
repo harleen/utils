@@ -23,6 +23,7 @@ Usage:
 """
 
 import base64
+import json
 import re
 import sys
 import warnings
@@ -62,6 +63,30 @@ _RESET     = "\033[0m"
 _BUILTIN_AUTO_APPROVE = {"get_model_provider"}
 
 
+def _load_preferences_block(path: Path, categories: list) -> str:
+    """Read a preferences JSON file (if it exists) and format its contents as a
+    '## Standing preferences' system-prompt block. Returns '' if the file doesn't exist
+    yet or has nothing saved — a harness enabling preferences_path for the first time
+    shouldn't show an empty section."""
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+    sections = []
+    for cat in categories:
+        notes = data.get(cat, [])
+        if notes:
+            label = cat.replace("_", " ").capitalize()
+            sections.append(f"{label}:\n" + "\n".join(f"- {n}" for n in notes))
+
+    if not sections:
+        return ""
+    return "\n\n## Standing preferences\n" + "\n\n".join(sections)
+
+
 # ── public entry point ────────────────────────────────────────────────────────
 
 def run_agent(
@@ -76,6 +101,8 @@ def run_agent(
     model: str = "claude-haiku-4-5-20251001",
     model_provider: str = "anthropic",
     max_context_messages: int = 50,
+    preferences_path: "str | Path | None" = None,
+    preference_categories: "list[str] | None" = None,
 ) -> None:
     """
     Build a LangGraph ReAct agent and start the terminal conversation loop.
@@ -99,7 +126,24 @@ def run_agent(
                               what's resent to the API each turn, not what's persisted. A
                               built-in `recall_earlier_messages` tool lets the model search
                               back through the untrimmed history on demand when needed.
+        preferences_path:     Optional path to a JSON file of standing preferences the
+                              agent can save to and reads back at every startup — a
+                              save_preference tool is added automatically when this is
+                              set (auto-approved: local write, no side effects). Lets
+                              corrections/standing rules ("always do X without asking")
+                              persist across sessions instead of being lost on the next
+                              thread rotation. Not enabled unless this is set.
+        preference_categories: Category names save_preference accepts (e.g.
+                              ["workflow_rules", "search_defaults"]). Required if
+                              preferences_path is set. Describe what each category is for
+                              in your own system_prompt — the tool's own description
+                              stays generic/project-agnostic.
     """
+    if preferences_path is not None:
+        system_prompt = system_prompt + _load_preferences_block(
+            Path(preferences_path), preference_categories or []
+        )
+
     if model_provider == "openai":
         if ChatOpenAI is None:
             raise ImportError("langchain-openai is not installed. Run: pip install langchain-openai")
@@ -162,6 +206,46 @@ def run_agent(
         return {"llm_input_messages": trimmed}
 
     all_tools = list(tools) + [get_model_provider]
+    extra_auto_approve: set = set()
+
+    if preferences_path is not None:
+        _prefs_path = Path(preferences_path)
+        _categories = preference_categories or []
+
+        @_tool
+        def save_preference(category: str, note: str) -> str:
+            """Save a standing preference or correction so it persists across sessions —
+            call this proactively whenever the user corrects a miss, states a standing
+            rule ("always...", "remember that..."), or a pattern recurs that reveals an
+            implicit preference. Saved preferences are loaded into every future session's
+            system prompt automatically, so don't ask again about something already
+            covered.
+
+            category: which category this belongs to (see your system prompt for the
+              valid categories and what each one is for).
+            note: the preference itself, written so it reads clearly out of context
+              later, without relying on this conversation's context.
+            """
+            if category not in _categories:
+                return f"category must be one of {_categories}, got '{category}'"
+            if _prefs_path.exists():
+                try:
+                    data = json.loads(_prefs_path.read_text())
+                except (json.JSONDecodeError, OSError):
+                    data = {}
+            else:
+                data = {}
+            cleaned = note.strip()
+            existing = data.setdefault(category, [])
+            if cleaned in existing:
+                return f"Already saved under {category} — no change."
+            existing.append(cleaned)
+            _prefs_path.parent.mkdir(parents=True, exist_ok=True)
+            _prefs_path.write_text(json.dumps(data, indent=2))
+            return f"Saved to {category}: {cleaned}"
+
+        all_tools = all_tools + [save_preference]
+        extra_auto_approve = {"save_preference"}
 
     with SqliteSaver.from_conn_string(str(db_path)) as checkpointer:
         config = {"configurable": {"thread_id": thread_id}}
@@ -283,7 +367,7 @@ def run_agent(
             fresh_start_message=fresh_start_message,
             resume_message=resume_message,
             verbatim_tool_names=verbatim_tool_names or [],
-            auto_approve_tool_names=set(auto_approve_tool_names or []) | _BUILTIN_AUTO_APPROVE,
+            auto_approve_tool_names=set(auto_approve_tool_names or []) | _BUILTIN_AUTO_APPROVE | extra_auto_approve,
             streaming=(model_provider in ("openai", "ollama")),
         )
 
