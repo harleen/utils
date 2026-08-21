@@ -27,6 +27,7 @@ import json
 import re
 import sys
 import warnings
+import webbrowser
 from pathlib import Path
 
 from prompt_toolkit import prompt as _pt_prompt
@@ -56,6 +57,19 @@ from langgraph.prebuilt import create_react_agent
 #   magenta \033[35m   green   \033[32m
 _ASSISTANT = "\033[36m"
 _RESET     = "\033[0m"
+
+# Model tiers — pick by call site, not by habit. These are for two separate
+# call sites (e.g. an interactive tool-routing loop vs. a standalone judgment
+# call), not for switching models mid-conversation.
+#   REASONING_MODEL     — judgment-heavy work: matching nuance, weighing
+#                         tradeoffs, curation/summarization that needs to
+#                         avoid fabricating detail.
+#   TOOL_HARNESS_MODEL  — mechanical tool selection/dispatch in a well-specified
+#                         ReAct loop, where the decision is usually unambiguous.
+# Update these two lines when Anthropic ships a better price/quality point —
+# every caller picks up the change without editing their own config.
+REASONING_MODEL = "claude-sonnet-5"
+TOOL_HARNESS_MODEL = "claude-haiku-4-5"
 
 # Tools this module injects itself (see get_model_provider below) are always safe to
 # auto-approve — read-only, zero cost, zero side effects. Baked in here rather than left
@@ -182,6 +196,20 @@ def run_agent(
         (running fully locally/offline) or 'anthropic'/'openai' (running in the cloud)."""
         return model_provider
 
+    @_tool
+    def open_in_browser(url: str) -> str:
+        """Open a URL in the user's default web browser. Use when the user asks to
+        open/view a link (e.g. "open that submission page") rather than just showing the
+        URL as text. Opens whatever browser is set as the OS default — there's no way to
+        target a specific browser or read the page back once opened."""
+        try:
+            opened = webbrowser.open(url)
+        except Exception as e:
+            return f"Could not open {url}: {e}"
+        if opened:
+            return f"Opened {url} in the default browser."
+        return f"Could not open a browser for {url} (no browser available in this environment)."
+
     def _trim_hook(state: dict) -> dict:
         """pre_model_hook — bounds what's sent to the model to the most recent
         max_context_messages, without touching the permanently persisted `messages`
@@ -205,7 +233,7 @@ def run_agent(
         )
         return {"llm_input_messages": trimmed}
 
-    all_tools = list(tools) + [get_model_provider]
+    all_tools = list(tools) + [get_model_provider, open_in_browser]
     extra_auto_approve: set = set()
 
     if preferences_path is not None:

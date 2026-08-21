@@ -23,6 +23,11 @@ Handles the boilerplate so each new agent project only needs a system prompt and
   Preferences persist across thread rotations by living in the system prompt (loaded fresh at
   every startup) rather than in conversation history. Off by default — only added when a
   caller opts in.
+- **`open_in_browser`** — built-in tool, opens a URL in the OS default browser
+  (`webbrowser.open`). Not auto-approved (a real, visible side effect) — pauses for
+  confirmation like any other tool unless a harness explicitly whitelists it. No way to target
+  a specific browser or read the page back; that would need something outside this library
+  entirely (e.g. a Chrome-automation integration), not reachable from a plain LangChain tool.
 
 ## Install
 
@@ -84,6 +89,4 @@ tool call is cancelled and the agent reconsiders with your feedback.
 
 ## Used in
 
-- `matchPFCTransactions` — monthly PFC bank reconciliation agent
-- `poetry-tools` — poetry submission assistant (`build/assistant/harness.py`)
-- `translation-tools` — Punjabi/Hindi/Urdu translation assistant
+3 local assistants 
