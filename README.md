@@ -28,6 +28,12 @@ Handles the boilerplate so each new agent project only needs a system prompt and
   confirmation like any other tool unless a harness explicitly whitelists it. No way to target
   a specific browser or read the page back; that would need something outside this library
   entirely (e.g. a Chrome-automation integration), not reachable from a plain LangChain tool.
+- **Model tiers** — `REASONING_MODEL` and `TOOL_HARNESS_MODEL` are shared constants for two
+  separate call sites (e.g. an interactive tool-routing loop vs. a standalone judgment call),
+  not for switching models mid-conversation. `TOOL_HARNESS_MODEL` is the cheap/fast pick for
+  mechanical tool dispatch; `REASONING_MODEL` is for judgment-heavy work like curation —
+  "best" here means best price/quality tradeoff, not reflexively the most expensive model
+  available. Update the two constants in one place as Anthropic ships new models.
 
 ## Install
 
